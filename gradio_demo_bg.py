@@ -4,7 +4,7 @@ import gradio as gr
 import numpy as np
 import torch
 from datetime import datetime
-from time
+import time
 import safetensors.torch as sf
 import db_examples
 

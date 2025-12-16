@@ -4,7 +4,6 @@ import gradio as gr
 import numpy as np
 import torch
 from datetime import datetime
-import time
 import safetensors.torch as sf
 import db_examples
 
@@ -19,8 +18,6 @@ from torch.hub import download_url_to_file
 
 OUTPUT_DIR = "./outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-# 'stablediffusionapi/realistic-vision-v51'
-# 'runwayml/stable-diffusion-v1-5'
 sd15_name = 'stablediffusionapi/realistic-vision-v51'
 tokenizer = CLIPTokenizer.from_pretrained(sd15_name, subfolder="tokenizer")
 text_encoder = CLIPTextModel.from_pretrained(sd15_name, subfolder="text_encoder")
@@ -49,8 +46,6 @@ def hooked_unet_forward(sample, timestep, encoder_hidden_states, **kwargs):
 
 unet.forward = hooked_unet_forward
 
-# Load
-
 model_path = './models/iclight_sd15_fbc.safetensors'
 
 if not os.path.exists(model_path):
@@ -63,20 +58,14 @@ sd_merged = {k: sd_origin[k] + sd_offset[k] for k in sd_origin.keys()}
 unet.load_state_dict(sd_merged, strict=True)
 del sd_offset, sd_origin, sd_merged, keys
 
-# Device
-
 device = torch.device('cuda')
 text_encoder = text_encoder.to(device=device, dtype=torch.float16)
 vae = vae.to(device=device, dtype=torch.bfloat16)
 unet = unet.to(device=device, dtype=torch.float16)
 rmbg = rmbg.to(device=device, dtype=torch.float32)
 
-# SDP
-
 unet.set_attn_processor(AttnProcessor2_0())
 vae.set_attn_processor(AttnProcessor2_0())
-
-# Samplers
 
 ddim_scheduler = DDIMScheduler(
     num_train_timesteps=1000,
@@ -103,8 +92,6 @@ dpmpp_2m_sde_karras_scheduler = DPMSolverMultistepScheduler(
     use_karras_sigmas=True,
     steps_offset=1
 )
-
-# Pipelines
 
 t2i_pipe = StableDiffusionPipeline(
     vae=vae,
@@ -192,7 +179,7 @@ def pytorch2numpy(imgs, quant=True):
 
 @torch.inference_mode()
 def numpy2pytorch(imgs):
-    h = torch.from_numpy(np.stack(imgs, axis=0)).float() / 127.0 - 1.0  # so that 127 must be strictly 0.0
+    h = torch.from_numpy(np.stack(imgs, axis=0)).float() / 127.0 - 1.0
     h = h.movedim(-1, 1)
     return h
 
@@ -233,8 +220,28 @@ def run_rmbg(img, sigma=0.0):
     return result.clip(0, 255).astype(np.uint8), alpha
 
 
+def save_images_to_file(images, prefix="output"):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    saved_files = []
+    
+    for i, img in enumerate(images):
+        filename = f"{prefix}_{timestamp}_{i}.png"
+        filepath = os.path.join(OUTPUT_DIR, filename)
+        
+        if isinstance(img, np.ndarray):
+            if img.dtype == np.float32:
+                img = (img * 255).clip(0, 255).astype(np.uint8)
+            Image.fromarray(img).save(filepath)
+        else:
+            img.save(filepath)
+        
+        saved_files.append(filepath)
+    
+    return saved_files
+
+
 @torch.inference_mode()
-def process(input_fg, input_bg, prompt, image_width, image_height, num_samples, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, bg_source):
+def process(input_fg, input_bg, prompt, image_width, image_height, num_samples, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, bg_source, remove_bg):
     bg_source = BGSource(bg_source)
 
     if bg_source == BGSource.UPLOAD:
@@ -261,6 +268,9 @@ def process(input_fg, input_bg, prompt, image_width, image_height, num_samples, 
         input_bg = np.stack((image,) * 3, axis=-1).astype(np.uint8)
     else:
         raise 'Wrong background source!'
+
+    if remove_bg:
+        input_fg, _ = run_rmbg(input_fg)
 
     rng = torch.Generator(device=device).manual_seed(seed)
 
@@ -322,44 +332,38 @@ def process(input_fg, input_bg, prompt, image_width, image_height, num_samples, 
     pixels = vae.decode(latents).sample
     pixels = pytorch2numpy(pixels, quant=False)
 
-    return pixels, [fg, bg]
+    saved_files = save_images_to_file(pixels, "relight")
+    
+    return pixels + [fg, bg], gr.File(value=saved_files, visible=True)
 
 
 @torch.inference_mode()
-def process_relight(input_fg, input_bg, prompt, image_width, image_height, num_samples, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, bg_source):
-    input_fg, matting = run_rmbg(input_fg)
-    results, extra_images = process(input_fg, input_bg, prompt, image_width, image_height, num_samples, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, bg_source)
-    results = [(x * 255.0).clip(0, 255).astype(np.uint8) for x in results]
+def process_relight(input_fg, input_bg, prompt, image_width, image_height, num_samples, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, bg_source, remove_bg):
+    if remove_bg:
+        input_fg, matting = run_rmbg(input_fg)
     
-    # 画像を保存
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    saved_files = []
+    results, file_component = process(input_fg, input_bg, prompt, image_width, image_height, num_samples, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, bg_source, remove_bg)
+    results = [(x * 255.0).clip(0, 255).astype(np.uint8) if x.dtype == np.float32 else x for x in results]
     
-    for i, img in enumerate(results):
-        filename = f"relight_{timestamp}_{i}.png"
-        filepath = os.path.join(OUTPUT_DIR, filename)
-        Image.fromarray(img).save(filepath)
-        saved_files.append(filepath)
-        print(f"Saved: {filepath}")
-    
-    return results + extra_images
+    return results, file_component
 
 
 @torch.inference_mode()
-def process_normal(input_fg, input_bg, prompt, image_width, image_height, num_samples, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, bg_source):
-    input_fg, matting = run_rmbg(input_fg, sigma=16)
+def process_normal(input_fg, input_bg, prompt, image_width, image_height, num_samples, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, bg_source, remove_bg):
+    sigma = 16 if remove_bg else 0
+    input_fg, matting = run_rmbg(input_fg, sigma=sigma)
 
     print('left ...')
-    left = process(input_fg, input_bg, prompt, image_width, image_height, 1, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, BGSource.LEFT.value)[0][0]
+    left = process(input_fg, input_bg, prompt, image_width, image_height, 1, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, BGSource.LEFT.value, False)[0][0]
 
     print('right ...')
-    right = process(input_fg, input_bg, prompt, image_width, image_height, 1, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, BGSource.RIGHT.value)[0][0]
+    right = process(input_fg, input_bg, prompt, image_width, image_height, 1, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, BGSource.RIGHT.value, False)[0][0]
 
     print('bottom ...')
-    bottom = process(input_fg, input_bg, prompt, image_width, image_height, 1, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, BGSource.BOTTOM.value)[0][0]
+    bottom = process(input_fg, input_bg, prompt, image_width, image_height, 1, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, BGSource.BOTTOM.value, False)[0][0]
 
     print('top ...')
-    top = process(input_fg, input_bg, prompt, image_width, image_height, 1, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, BGSource.TOP.value)[0][0]
+    top = process(input_fg, input_bg, prompt, image_width, image_height, 1, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, BGSource.TOP.value, False)[0][0]
 
     inner_results = [left * 2.0 - 1.0, right * 2.0 - 1.0, bottom * 2.0 - 1.0, top * 2.0 - 1.0]
 
@@ -392,21 +396,9 @@ def process_normal(input_fg, input_bg, prompt, image_width, image_height, num_sa
     results = [normal, left, right, bottom, top] + inner_results
     results = [(x * 127.5 + 127.5).clip(0, 255).astype(np.uint8) for x in results]
     
-    # 画像を保存
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    saved_files = []
+    saved_files = save_images_to_file(results, "normal")
     
-    # 各画像のタイプを定義
-    image_types = ['normal', 'left', 'right', 'bottom', 'top', 'inner_left', 'inner_right', 'inner_bottom', 'inner_top']
-    
-    for i, (img_type, img) in enumerate(zip(image_types, results)):
-        filename = f"normal_{timestamp}_{img_type}.png"
-        filepath = os.path.join(OUTPUT_DIR, filename)
-        Image.fromarray(img).save(filepath)
-        saved_files.append(filepath)
-        print(f"Saved: {filepath}")
-    
-    return results
+    return results, gr.File(value=saved_files, visible=True)
 
 
 quick_prompts = [
@@ -445,6 +437,8 @@ with block:
             bg_source = gr.Radio(choices=[e.value for e in BGSource],
                                  value=BGSource.UPLOAD.value,
                                  label="Background Source", type='value')
+            
+            remove_bg = gr.Checkbox(label="Remove Foreground Background", value=True)
 
             example_prompts = gr.Dataset(samples=quick_prompts, label='Prompt Quick List', components=[prompt])
             bg_gallery = gr.Gallery(height=450, object_fit='contain', label='Background Quick List', value=db_examples.bg_samples, columns=5, allow_preview=False)
@@ -467,22 +461,25 @@ with block:
                 n_prompt = gr.Textbox(label="Negative Prompt",
                                       value='lowres, bad anatomy, bad hands, cropped, worst quality')
                 normal_button = gr.Button(value="Compute Normal (4x Slower)")
+        
         with gr.Column():
-            result_gallery = gr.Gallery(height=832, object_fit='contain', label='Outputs')
-    with gr.Row():
-        dummy_image_for_outputs = gr.Image(visible=False, label='Result')
-        gr.Examples(
-            fn=lambda *args: [args[-1]],
-            examples=db_examples.background_conditioned_examples,
-            inputs=[
-                input_fg, input_bg, prompt, bg_source, image_width, image_height, seed, dummy_image_for_outputs
-            ],
-            outputs=[result_gallery],
-            run_on_click=True, examples_per_page=1024
-        )
-    ips = [input_fg, input_bg, prompt, image_width, image_height, num_samples, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, bg_source]
-    relight_button.click(fn=process_relight, inputs=ips, outputs=[result_gallery])
-    normal_button.click(fn=process_normal, inputs=ips, outputs=[result_gallery])
+            result_gallery = gr.Gallery(height=700, object_fit='contain', label='Outputs')
+            download_files = gr.File(label="Download Generated Images", visible=False)
+
+    ips = [input_fg, input_bg, prompt, image_width, image_height, num_samples, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, bg_source, remove_bg]
+    
+    relight_button.click(
+        fn=process_relight, 
+        inputs=ips, 
+        outputs=[result_gallery, download_files]
+    )
+    
+    normal_button.click(
+        fn=process_normal, 
+        inputs=ips, 
+        outputs=[result_gallery, download_files]
+    )
+    
     example_prompts.click(lambda x: x[0], inputs=example_prompts, outputs=prompt, show_progress=False, queue=False)
 
     def bg_gallery_selected(gal, evt: gr.SelectData):

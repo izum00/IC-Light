@@ -15,7 +15,8 @@ from briarmbg import BriaRMBG
 from enum import Enum
 from torch.hub import download_url_to_file
 
-
+OUTPUT_DIR = "./outputs"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 # 'stablediffusionapi/realistic-vision-v51'
 # 'runwayml/stable-diffusion-v1-5'
 sd15_name = 'stablediffusionapi/realistic-vision-v51'
@@ -26,6 +27,7 @@ unet = UNet2DConditionModel.from_pretrained(sd15_name, subfolder="unet")
 rmbg = BriaRMBG.from_pretrained("briaai/RMBG-1.4")
 
 # Change UNet
+def save_images_to_server(images, prefix="result"):
 
 with torch.no_grad():
     new_conv_in = torch.nn.Conv2d(12, unet.conv_in.out_channels, unet.conv_in.kernel_size, unet.conv_in.stride, unet.conv_in.padding)
@@ -328,6 +330,18 @@ def process_relight(input_fg, input_bg, prompt, image_width, image_height, num_s
     input_fg, matting = run_rmbg(input_fg)
     results, extra_images = process(input_fg, input_bg, prompt, image_width, image_height, num_samples, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, bg_source)
     results = [(x * 255.0).clip(0, 255).astype(np.uint8) for x in results]
+    
+    # 画像を保存
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    saved_files = []
+    
+    for i, img in enumerate(results):
+        filename = f"relight_{timestamp}_{i}.png"
+        filepath = os.path.join(OUTPUT_DIR, filename)
+        Image.fromarray(img).save(filepath)
+        saved_files.append(filepath)
+        print(f"Saved: {filepath}")
+    
     return results + extra_images
 
 
@@ -377,6 +391,21 @@ def process_normal(input_fg, input_bg, prompt, image_width, image_height, num_sa
 
     results = [normal, left, right, bottom, top] + inner_results
     results = [(x * 127.5 + 127.5).clip(0, 255).astype(np.uint8) for x in results]
+    
+    # 画像を保存
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    saved_files = []
+    
+    # 各画像のタイプを定義
+    image_types = ['normal', 'left', 'right', 'bottom', 'top', 'inner_left', 'inner_right', 'inner_bottom', 'inner_top']
+    
+    for i, (img_type, img) in enumerate(zip(image_types, results)):
+        filename = f"normal_{timestamp}_{img_type}.png"
+        filepath = os.path.join(OUTPUT_DIR, filename)
+        Image.fromarray(img).save(filepath)
+        saved_files.append(filepath)
+        print(f"Saved: {filepath}")
+    
     return results
 
 
